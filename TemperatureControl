@@ -1,0 +1,156 @@
+#include <EEPROM.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+#define ONE_WIRE_BUS 2 // DAT датчика -> D2
+#define RELAY_PIN 7    // Реле насоса -> D7
+
+#define PUMP_ON  LOW
+#define PUMP_OFF HIGH
+
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+int targetTemp;
+int hysteresis;
+bool isPumpRunning = false;
+unsigned long lastTempRequest = 0;
+float currentTemp = 0.0;
+
+// 0 - молчать, 1 - слать лог каждую секунду
+bool liveStreamEnabled = false; 
+
+void setup() {
+  Serial.begin(9600); // Скорость порта 9600
+  
+  digitalWrite(RELAY_PIN, PUMP_OFF);
+  pinMode(RELAY_PIN, OUTPUT);
+
+  sensors.begin();
+  sensors.setWaitForConversion(false); 
+
+  // Читаем настройки из памяти
+  targetTemp = EEPROM.read(0);
+  hysteresis = EEPROM.read(1);
+  liveStreamEnabled = EEPROM.read(2); 
+
+  // Защита от первого запуска
+  if (targetTemp == 255 || hysteresis == 255) {
+    targetTemp = 60; 
+    hysteresis = 5;  
+    liveStreamEnabled = false; 
+    EEPROM.update(0, targetTemp);
+    EEPROM.update(1, hysteresis);
+    EEPROM.update(2, liveStreamEnabled);
+  }
+
+  // Расширенная подсказка-шпаргалка при старте платы
+  Serial.println(F("\n=============================================="));
+  Serial.println(F("=== СИСТЕМА АВТОУПРАВЛЕНИЯ НАСОСОМ ГОТОВА ==="));
+  Serial.println(F("=============================================="));
+  Serial.print(F(" Уставки в памяти: Включение при ")); Serial.print(targetTemp); Serial.print(F(" C | "));
+  Serial.print(F("Гистерезис: ")); Serial.print(hysteresis); Serial.println(F(" C"));
+  Serial.print(F(" Текущий режим вывода логов: ")); Serial.println(liveStreamEnabled ? F("АКТИВЕН") : F("ТИШИНА"));
+  Serial.println(F("----------------------------------------------"));
+  Serial.println(F(" ДОСТУПНЫЕ КОМАНДЫ (вводить в строку терминала):"));
+  Serial.println(F("   S        - Запросить статус и показания (1 раз)"));
+  Serial.println(F("   M1       - Включить постоянный стрим данных (раз в сек)"));
+  Serial.println(F("   M0       - Выключить стрим (уйти в режим тишины)"));
+  Serial.println(F("   T[число] - Задать темп. включения (например: T65)"));
+  Serial.println(F("   H[число] - Задать гистерезис выключения (например: H8)"));
+  Serial.println(F("=============================================="));
+  
+  sensors.requestTemperatures();
+  lastTempRequest = millis();
+}
+
+void loop() {
+  checkSerial();
+
+  if (millis() - lastTempRequest >= 1000) {
+    currentTemp = sensors.getTempCByIndex(0);
+    sensors.requestTemperatures(); 
+    lastTempRequest = millis();
+
+    // Экстренный режим (Авария датчика)
+    if (currentTemp <= -100.0) {
+      Serial.println(F("[!!!] АВАРИЯ: Датчик ОТВАЛИЛСЯ! Насос ЗАПУЩЕН для защиты от кипения!"));
+      digitalWrite(RELAY_PIN, PUMP_ON);
+      isPumpRunning = true;
+      return; 
+    }
+
+    // Штатная работа реле
+    controlPump();
+    
+    // Выводим лог раз в секунду, только если он включен командой M1
+    if (liveStreamEnabled) {
+      printStatus();
+    }
+  }
+}
+
+void controlPump() {
+  if (currentTemp >= targetTemp) {
+    if (!isPumpRunning) {
+      digitalWrite(RELAY_PIN, PUMP_ON);
+      isPumpRunning = true;
+    }
+  } 
+  else if (currentTemp <= (targetTemp - hysteresis)) {
+    if (isPumpRunning) {
+      digitalWrite(RELAY_PIN, PUMP_OFF);
+      isPumpRunning = false;
+    }
+  }
+}
+
+void checkSerial() {
+  if (Serial.available() > 0) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    input.toUpperCase();
+
+    if (input == "S" || input == "STATUS") {
+      printStatus();
+    }
+    else if (input == "M1") {
+      liveStreamEnabled = true;
+      EEPROM.update(2, liveStreamEnabled);
+      Serial.println(F("-> ОК: Постоянный мониторинг ВКЛЮЧЕН"));
+    }
+    else if (input == "M0") {
+      liveStreamEnabled = false;
+      EEPROM.update(2, liveStreamEnabled);
+      Serial.println(F("-> ОК: Мониторинг ВЫКЛЮЧЕН (режим тишины)"));
+    }
+    else if (input.startsWith("T")) {
+      int newTemp = input.substring(1).toInt();
+      if (newTemp >= 10 && newTemp <= 100) {
+        targetTemp = newTemp;
+        EEPROM.update(0, targetTemp);
+        Serial.print(F("-> ОК: Температура включения изменена на: ")); Serial.print(targetTemp); Serial.println(F(" C"));
+      } else {
+        Serial.println(F("[!] Ошибка: Температура должна быть от 10 до 100"));
+      }
+    } 
+    else if (input.startsWith("H")) {
+      int newHyst = input.substring(1).toInt();
+      if (newHyst >= 1 && newHyst <= 30) {
+        hysteresis = newHyst;
+        EEPROM.update(1, hysteresis);
+        Serial.print(F("-> ОК: Гистерезис изменен на: ")); Serial.print(hysteresis); Serial.println(F(" C"));
+      } else {
+        Serial.println(F("[!] Ошибка: Гистерезис должен быть от 1 до 30"));
+      }
+    }
+  }
+}
+
+void printStatus() {
+  Serial.print(F("Факт: ")); Serial.print(currentTemp, 1);
+  Serial.print(F(" C | Схема: [ВКЛ при >= ")); Serial.print(targetTemp);
+  Serial.print(F(" C / ВЫКЛ при <= ")); Serial.print(targetTemp - hysteresis);
+  Serial.print(F(" C] | Насос: "));
+  Serial.println(isPumpRunning ? F("РАБОТАЕТ (RUN)") : F("ОСТАНОВЛЕН (STOP)"));
+}
